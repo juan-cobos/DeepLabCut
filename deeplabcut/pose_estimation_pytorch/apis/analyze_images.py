@@ -10,10 +10,8 @@
 #
 from __future__ import annotations
 
-import glob
 import json
 import logging
-import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -26,7 +24,6 @@ import deeplabcut.pose_estimation_pytorch.data as data
 import deeplabcut.pose_estimation_pytorch.modelzoo as modelzoo
 from deeplabcut.core.engine import Engine
 from deeplabcut.modelzoo.utils import get_superanimal_colormaps
-from deeplabcut.pose_estimation_pytorch.apis.ctd import get_condition_provider
 from deeplabcut.pose_estimation_pytorch.apis.utils import (
     build_predictions_dataframe,
     get_detector_inference_runner,
@@ -37,8 +34,8 @@ from deeplabcut.pose_estimation_pytorch.apis.utils import (
     get_scorer_uid,
     parse_snapshot_index_for_analysis,
 )
+from deeplabcut.pose_estimation_pytorch.config.ctd_conditions import ConditionsModelConfig, ConditionsShuffleConfig
 from deeplabcut.pose_estimation_pytorch.config.pose import PoseConfig
-from deeplabcut.pose_estimation_pytorch.data.ctd import CondFromModel
 from deeplabcut.pose_estimation_pytorch.modelzoo.utils import (
     COCO_PERSON_CATEGORY_ID,
 )
@@ -79,16 +76,18 @@ def superanimal_analyze_images(
         model_name: str
             The name of the pose model architecture to use for inference. To get a list
             of available models for a SuperAnimal, call:
-                >>> import dlclibrary
-                >>> superanimal_name = "superanimal_topviewmouse"
-                >>> dlclibrary.get_available_models(superanimal_name)
+
+                import dlclibrary
+                superanimal_name = "superanimal_topviewmouse"
+                dlclibrary.get_available_models(superanimal_name)
 
         detector_name: str
             The name of the detector architecture to use for inference. To get a list
             of available detectors for a SuperAnimal, call:
-                >>> import dlclibrary
-                >>> superanimal_name = "superanimal_topviewmouse"
-                >>> dlclibrary.get_available_detectors(superanimal_name)
+
+                import dlclibrary
+                superanimal_name = "superanimal_topviewmouse"
+                dlclibrary.get_available_detectors(superanimal_name)
 
         images: str, Path, list[str], list[Path]
             The images to analyze. Can either be a directory containing images, or
@@ -122,16 +121,16 @@ def superanimal_analyze_images(
             A customized SuperAnimal model configuration, as an alternative to the
             default SuperAnimal model configuration. You can get the default SuperAnimal
             config with:
-                >>> import deeplabcut.pose_estimation_pytorch.modelzoo as modelzoo
-                >>> config = modelzoo.load_super_animal_config(
-                >>>     super_animal, model_name, detector_name,
-                >>> )
+                import deeplabcut.pose_estimation_pytorch.modelzoo as modelzoo
+                config = modelzoo.load_super_animal_config(
+                    super_animal, model_name, detector_name,
+                )
 
-        customized_pose_checkpoint: str | None
+        customized_pose_checkpoint (str | Path | None, optional):
             A customized SuperAnimal pose checkpoint, as an alternative to the
             HuggingFace SuperAnimal models.
 
-        customized_detector_checkpoint: str | None
+        customized_detector_checkpoint (str | Path | None, optional):
             A customized SuperAnimal detector checkpoint, as an alternative to the
             HuggingFace SuperAnimal models.
 
@@ -139,19 +138,19 @@ def superanimal_analyze_images(
         The predictions made by the model for each image.
 
     Examples:
-        >>> from deeplabcut.pose_estimation_pytorch.apis import (
-        >>>     superanimal_analyze_images
-        >>> )
-        >>> predictions = superanimal_analyze_images(
-        >>>     superanimal_name="superanimal_topviewmouse",
-        >>>     model_name="resnet_50",
-        >>>     detector_name="fasterrcnn_mobilenet_v3_large_fpn",
-        >>>     images="test_mouse_images",
-        >>>     max_individuals=3,
-        >>>     out_folder="test_mouse_images_labeled",
-        >>>     device="cuda:0",
-        >>>     pose_threshold=0.1,
-        >>> )
+        from deeplabcut.pose_estimation_pytorch.apis import (
+            superanimal_analyze_images
+        )
+        predictions = superanimal_analyze_images(
+            superanimal_name="superanimal_topviewmouse",
+            model_name="resnet_50",
+            detector_name="fasterrcnn_mobilenet_v3_large_fpn",
+            images="test_mouse_images",
+            max_individuals=3,
+            out_folder="test_mouse_images_labeled",
+            device="cuda:0",
+            pose_threshold=0.1,
+        )
     """
     out_folder = Path(out_folder)
     out_folder.mkdir(exist_ok=True, parents=True)
@@ -249,7 +248,7 @@ def analyze_images(
     pcutoff: float | None = None,
     bbox_pcutoff: float | None = None,
     plot_skeleton: bool = True,
-    ctd_conditions: dict | CondFromModel | None = None,
+    ctd_conditions: dict | ConditionsShuffleConfig | ConditionsModelConfig | None = None,
 ) -> dict[str, dict]:
     """Runs analysis on images using a pose model.
 
@@ -281,14 +280,11 @@ def analyze_images(
             None or in (0, 1). If None, it is read from the project configuration file.
         plot_skeleton: If a skeleton is defined in the model configuration file, whether
             to plot the skeleton connecting the predicted bodyparts on the images.
-        ctd_conditions: Only for CTD models. If None, the configuration for the
-            condition provider will be loaded from the pytorch_config file (under the
-            "inference": "conditions"). If the ctd_conditions is given as a dict, creates a
-            CondFromModel from the dict. Otherwise, a CondFromModel can be given
-            directly. Example configuration:
-                ```
-                ctd_conditions = {"shuffle": 17, "snapshot": "snapshot-best-190.pt"}
-                ```
+        ctd_conditions: Only for CTD models. Specifies the BU model used to generate
+            conditions. If None, loaded from the pytorch_config file (under
+            ``"inference": "conditions"``). Accepts a raw dict or a typed
+            ``ConditionsModelConfig`` / ``ConditionsShuffleConfig``. A BU model
+            is required for live inference; file / path conditions not valid.
 
     Returns:
         A dictionary mapping each image filename to the different types of predictions
@@ -296,7 +292,7 @@ def analyze_images(
     """
     cfg = auxiliaryfunctions.read_config(config)
     train_frac = cfg["TrainingFraction"][trainingsetindex]
-    model_folder = Path(cfg["project_path"]) / auxiliaryfunctions.get_model_folder(
+    model_folder = cfg.project_path / auxiliaryfunctions.get_model_folder(
         train_frac,
         shuffle,
         cfg,
@@ -309,6 +305,12 @@ def analyze_images(
     model_cfg = PoseConfig.from_any(model_cfg_path)
     pose_task = Task(model_cfg["method"])
 
+    if pose_task == Task.COND_TOP_DOWN:
+        ctd_conditions = model_cfg.inference.conditions if ctd_conditions is None else ctd_conditions
+        if ctd_conditions is None:
+            raise ValueError("CTD conditions are required for image analysis with cond-top-down models")
+        ctd_conditions = ConditionsModelConfig.resolve_from_conditions(ctd_conditions, config=config)
+
     # get the snapshots to analyze images with
     snapshot_index, detector_snapshot_index = parse_snapshot_index_for_analysis(
         cfg, model_cfg, snapshot_index, detector_snapshot_index
@@ -317,23 +319,6 @@ def analyze_images(
     detector_snapshot = None
     if detector_snapshot_index is not None:
         detector_snapshot = get_model_snapshots(detector_snapshot_index, train_folder, Task.DETECT)[0]
-
-    # Load the BU model for the conditions provider
-    cond_provider = None
-    if pose_task == Task.COND_TOP_DOWN:
-        if ctd_conditions is None:
-            cond_provider = get_condition_provider(
-                condition_cfg=model_cfg["inference"]["conditions"],
-                config=config,
-            )
-        # TODO @deruyter92: decide on typed / plain dict
-        elif isinstance(ctd_conditions, dict):
-            cond_provider = get_condition_provider(
-                condition_cfg=ctd_conditions,
-                config=config,
-            )
-        else:
-            cond_provider = ctd_conditions
 
     predictions = analyze_image_folder(
         model_cfg=model_cfg,
@@ -344,7 +329,7 @@ def analyze_images(
         device=device,
         max_individuals=max_individuals,
         progress_bar=progress_bar,
-        cond_provider=cond_provider,
+        cond_provider=ctd_conditions,
     )
 
     if not predictions:
@@ -353,7 +338,7 @@ def analyze_images(
 
     if output_dir is None:
         images = list(predictions.keys())
-        output_dir = Path(images[0]).parent.resolve()
+        output_dir = Path(images[0]).parent.absolute()
         print(f"Setting output directory to {output_dir}")
 
     output_dir = Path(output_dir)
@@ -431,7 +416,7 @@ def analyze_image_folder(
     max_individuals: int | None = None,
     progress_bar: bool = True,
     filtered_detector_config: dict | None = None,
-    cond_provider: CondFromModel | None = None,
+    cond_provider: ConditionsModelConfig | None = None,
 ) -> dict[str, dict[str, np.ndarray | np.ndarray]]:
     """Runs pose inference on a folder of images and returns the predictions.
 
@@ -451,21 +436,30 @@ def analyze_image_folder(
         progress_bar: Whether to display a progress bar when running inference.
         filtered_detector_config: If using a filtered torchvision detector instead of a saved detector snapshot,
             specify the filtered detector configuration
-        cond_provider: If using a CTD model - this parameter is needed to provide the conditions
+        cond_provider: If using a CTD model - needed to configure the BU model for generating conditions. A
+            ``ConditionsModelConfig`` is required (resolve shuffle refs first). File conditions are
+            evaluation-only and not valid here.
 
     Returns:
         A dictionary mapping each image filename to the different types of predictions
         for it (e.g. "bodyparts", "unique_bodyparts", "bboxes", "bbox_scores")
 
     Raises:
-        ValueError: if the pose model is a top-down model but no detector path is given
+        ValueError: If the pose model is a top-down model but no detector path is given
     """
     model_cfg = PoseConfig.from_any(model_cfg)
 
     pose_task = Task(model_cfg["method"])
+    if pose_task == Task.COND_TOP_DOWN:
+        if not isinstance(cond_provider, ConditionsModelConfig):
+            raise TypeError(
+                "A ``ConditionsModelConfig`` must be specified for image folder analysis with cond-top-down models. Got"
+                f" type(cond_provider)={type(cond_provider).__name__!r}. Please correctly specify ``cond_provider``."
+            )
+
     if pose_task == Task.TOP_DOWN and detector_path is None and filtered_detector_config is None:
         raise ValueError(
-            "A detector path or filtered_detector_config must be specified for image analysis using top-down models"
+            "A detector path or filtered_detector_config must be specified for image analysis using top-down models."
             " Please specify the `detector_path` parameter or the `filtered_detector_config` parameter."
         )
 
@@ -474,12 +468,6 @@ def analyze_image_folder(
 
     if device is None:
         device = resolve_device(model_cfg)
-
-    if pose_task == Task.COND_TOP_DOWN and cond_provider is None:
-        raise ValueError(
-            "A conditions provider must be specified for image analysis when using cond-top-down models"
-            " Please specify the `cond_provider` parameter."
-        )
 
     pose_runner = get_pose_inference_runner(
         model_config=model_cfg,
@@ -551,7 +539,7 @@ def plot_images_coco(
     detector_path: str | Path | None = None,
     device: str | None = None,
     max_individuals: int | None = None,
-    cond_provider: CondFromModel | None = None,
+    cond_provider: ConditionsModelConfig | None = None,
 ) -> list[dict]:
     """Runs pose inference on a folder of images from a COCO dataset, and plots all
     predicted keypoints and bounding boxes.
@@ -572,9 +560,9 @@ def plot_images_coco(
         A list of dictionaries containing predictions made on each image.
 
     Raises:
-        ValueError: if a top-down model configuration is given but detector_path is None
+        ValueError: If a top-down model configuration is given but detector_path is None
     """
-    with open(data_json_path) as f:
+    with Path(data_json_path).open() as f:
         obj = json.load(f)
 
     coco_images = obj["images"]
@@ -583,7 +571,7 @@ def plot_images_coco(
     image_name_to_id = {}
     for image in coco_images:
         # only works with relative path as a test image can be in a different folder
-        image_name = image["file_name"].split(os.sep)[-1]
+        image_name = Path(image["file_name"]).name
         image_name_to_id[image_name] = image["id"]
 
     image_id_to_annotations = defaultdict(list)
@@ -594,11 +582,11 @@ def plot_images_coco(
             image_id_to_annotations[image_id].append(annotation)
 
     # need to support more image types
-    images_in_folder = glob.glob(str(Path(image_folder) / "*.png"))
+    images_in_folder = list(Path(image_folder).glob("*.png"))
     corresponded_images = []
     for image in images_in_folder:
         image_path = image
-        image_name = image.split(os.sep)[-1]
+        image_name = Path(image).name
         if image_name in image_name_to_id:
             corresponded_images.append(image_path)
 
@@ -615,11 +603,11 @@ def plot_images_coco(
         cond_provider=cond_provider,
     )
 
-    os.makedirs(out_path, exist_ok=True)
+    Path(out_path).mkdir(parents=True, exist_ok=True)
 
     coco_format_predictions = []
     for image_path, prediction in predictions.items():
-        image_name = image_path.split(os.sep)[-1]
+        image_name = Path(image_path).name
         coco_prediction = dict(
             image_id=image_name_to_id[image_name],
             gt_annotations=image_id_to_annotations[image_name_to_id[image_name]],
@@ -654,8 +642,8 @@ def plot_images_coco(
             rect = plt.Rectangle((xmin, ymin), w, h, fill=False, edgecolor="blue", linewidth=2)
 
         ax.add_patch(rect)
-        image_name = image_path.split("/")[-1]
-        fig.savefig(os.path.join(out_path, image_name))
+        image_name = Path(image_path).name
+        fig.savefig(Path(out_path) / image_name)
 
     return coco_format_predictions
 

@@ -29,8 +29,8 @@ from torchvision.models.detection import (
 from deeplabcut.core.config import ProjectConfig
 from deeplabcut.core.deprecation import deprecated
 from deeplabcut.core.engine import Engine
+from deeplabcut.pose_estimation_pytorch.config.ctd_conditions import ConditionsModelConfig
 from deeplabcut.pose_estimation_pytorch.config.pose import PoseConfig
-from deeplabcut.pose_estimation_pytorch.data.ctd import CondFromModel
 from deeplabcut.pose_estimation_pytorch.data.dataset import PoseDatasetParameters
 from deeplabcut.pose_estimation_pytorch.data.dlcloader import (
     build_dlc_dataframe_columns,
@@ -130,9 +130,13 @@ def parse_snapshot_index_for_analysis(
 
 
 def return_train_network_path(
-    config: str, shuffle: int = 1, trainingsetindex: int = 0, modelprefix: str = ""
+    config: str | Path,
+    shuffle: int = 1,
+    trainingsetindex: int = 0,
+    modelprefix: str = "",
 ) -> tuple[Path, Path, Path]:
-    """
+    """Return the train network path.
+
     Args:
         config: Full path of the config.yaml file as a string.
         shuffle: The shuffle index to select for training
@@ -146,7 +150,7 @@ def return_train_network_path(
         the path to the folder containing the snapshots
     """
     cfg = auxiliaryfunctions.read_config(config)
-    project_path = Path(cfg["project_path"])
+    project_path = cfg.project_path
     train_frac = cfg["TrainingFraction"][trainingsetindex]
     model_folder = auxiliaryfunctions.get_model_folder(
         train_frac, shuffle, cfg, engine=Engine.PYTORCH, modelprefix=modelprefix
@@ -164,7 +168,8 @@ def get_model_snapshots(
     task: Task,
     snapshot_filter: list[str] | None = None,
 ) -> list[Snapshot]:
-    """
+    """Get the model snapshots.
+
     Args:
         index: Passing an index returns the snapshot with that index (where snapshots
             based on their number of training epochs, and the last snapshot is the
@@ -220,7 +225,8 @@ def get_model_snapshots(
 
 
 def get_scorer_uid(snapshot: Snapshot, detector_snapshot: Snapshot | None) -> str:
-    """
+    """Get the scorer uid.
+
     Args:
         snapshot: the snapshot for which to get the scorer UID
         detector_snapshot: if a top-down model is used with a detector, the detector
@@ -264,7 +270,7 @@ def get_scorer_name(
         the scorer name
     """
     cfg = ProjectConfig.from_any(cfg)
-    model_dir = Path(cfg["project_path"]) / auxiliaryfunctions.get_model_folder(
+    model_dir = cfg.project_path / auxiliaryfunctions.get_model_folder(
         train_fraction,
         shuffle,
         cfg,
@@ -345,7 +351,6 @@ def _image_names_to_df_index(
         image_names: list of image names
         image_name_to_index, optional: a transform to apply on each image_name
     """
-
     if image_name_to_index is not None:
         return pd.MultiIndex.from_tuples([image_name_to_index(image_name) for image_name in image_names])
     else:
@@ -422,7 +427,6 @@ def build_bboxes_dict_for_dataframe(
         Dictionary with sames keys as in the dataframe returned by
         build_predictions_dataframe, and respective bounding boxes and scores, if any.
     """
-
     image_names = []
     bboxes_data = []
     for image_name, image_predictions in predictions.items():
@@ -805,7 +809,7 @@ def get_pose_inference_runner(
     max_individuals: int | None = None,
     transform: A.BaseCompose | None = None,
     dynamic: DynamicCropper | None = None,
-    cond_provider: CondFromModel | None = None,
+    cond_provider: ConditionsModelConfig | None = None,
     ctd_tracking: bool | CTDTrackingConfig = False,
     inference_cfg: InferenceConfig | dict | None = None,
 ) -> PoseInferenceRunner:
@@ -823,8 +827,10 @@ def get_pose_inference_runner(
             cropping should not be used. Should only be used when creating inference
             runners for video pose estimation with batch size 1. For top-down pose
             estimation models, a `TopDownDynamicCropper` must be used.
-        cond_provider: Only for CTD models. If None, the CondProvider is created from
-            the pytorch_cfg.
+        cond_provider: Only for CTD models. A resolved ``ConditionsModelConfig`` for
+            the BU model used to generate conditions. Resolve shuffle / dict inputs
+            via ``ConditionsModelConfig.resolve_from_conditions()`` before calling
+            this function. File configs are not valid for live inference.
         ctd_tracking: Only for CTD models. Conditional top-down models can be used
             to directly track individuals. Poses from frame T are given as conditions
             for frame T+1. This also means a BU model is only needed to "initialize" the

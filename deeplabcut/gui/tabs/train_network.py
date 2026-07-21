@@ -10,12 +10,10 @@
 #
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QIcon
 
 import deeplabcut.compat as compat
 from deeplabcut.core.engine import Engine
@@ -27,6 +25,7 @@ from deeplabcut.gui.components import (
     _create_label_widget,
 )
 from deeplabcut.gui.displays.selected_shuffle_display import SelectedShuffleDisplay
+from deeplabcut.gui.gui_assets import icon_from_resource
 from deeplabcut.gui.widgets import ConfigEditor
 
 
@@ -75,7 +74,9 @@ class TrainNetwork(DefaultTab):
             self.resume_from_snapshot_label.show()
             self.snapshot_selection_widget.show()
             # Display detector snapshot selection widget only if in Top-Down mode
-            if self._shuffle_display.pose_cfg.get("method", "").lower() == "td":
+            pose_cfg = self._shuffle_display.pose_cfg
+            method = pose_cfg.get("method") if pose_cfg is not None else None
+            if isinstance(method, str) and method.lower() == "td":
                 self.detector_snapshot_selection_widget.show()
             else:
                 self.detector_snapshot_selection_widget.hide()
@@ -222,33 +223,35 @@ class TrainNetwork(DefaultTab):
         editor.show()
 
     def train_network(self):
-        config = self.root.config
-        shuffle = int(self._shuffle.value())
+        try:
+            config_path = self.root.config_path
+            shuffle = int(self._shuffle.value())
 
-        kwargs = dict(gputouse=None, autotune=False)
-        for k, spin_box in self._attribute_kwargs[self.root.engine].items():
-            kwargs[k] = int(spin_box.value())
-        if self.root.engine == Engine.PYTORCH:
-            snapshot_to_start_training_from = self.snapshot_selection_widget.selected_snapshot
-            if snapshot_to_start_training_from is not None:
-                kwargs["snapshot_path"] = snapshot_to_start_training_from
-            detector_to_start_training_from = self.detector_snapshot_selection_widget.selected_snapshot
-            if detector_to_start_training_from is not None:
-                kwargs["detector_path"] = detector_to_start_training_from
+            kwargs = dict(gputouse=None, autotune=False)
+            for k, spin_box in self._attribute_kwargs[self.root.engine].items():
+                kwargs[k] = int(spin_box.value())
+            if self.root.engine == Engine.PYTORCH:
+                snapshot_to_start_training_from = self.snapshot_selection_widget.selected_snapshot
+                if snapshot_to_start_training_from is not None:
+                    kwargs["snapshot_path"] = snapshot_to_start_training_from
+                detector_to_start_training_from = self.detector_snapshot_selection_widget.selected_snapshot
+                if detector_to_start_training_from is not None:
+                    kwargs["detector_path"] = detector_to_start_training_from
 
-        compat.train_network(config, shuffle, **kwargs)
-        msg = QtWidgets.QMessageBox()
-        msg.setIcon(QtWidgets.QMessageBox.Information)
-        msg.setText("The network is now trained and ready to evaluate.")
-        msg.setInformativeText("Use the function 'evaluate_network' to evaluate the network.")
+            compat.train_network(config_path, shuffle, **kwargs)
 
-        msg.setWindowTitle("Info")
-        msg.setMinimumWidth(900)
-        self.logo_dir = os.path.dirname(os.path.realpath("logo.png")) + os.path.sep
-        self.logo = self.logo_dir + "/assets/logo.png"
-        msg.setWindowIcon(QIcon(self.logo))
-        msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
-        msg.exec_()
+            msg = QtWidgets.QMessageBox()
+            msg.setIcon(QtWidgets.QMessageBox.Information)
+            msg.setText("The network is now trained and ready to evaluate.")
+            msg.setInformativeText("Use the function 'evaluate_network' to evaluate the network.")
+
+            msg.setWindowTitle("Info")
+            msg.setMinimumWidth(900)
+            msg.setWindowIcon(icon_from_resource("logo.png"))
+            msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
+            msg.exec_()
+        except Exception as error:
+            self.root.show_task_error(error, self.root.pose_cfg_path)
 
     @Slot(dict)
     def _pose_cfg_change(self, pose_cfg: dict | None) -> None:

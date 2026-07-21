@@ -30,17 +30,17 @@ COCO_PERSON_CATEGORY_ID = 1
 
 def get_model_configs_folder_path() -> Path:
     """Returns: the folder containing the SuperAnimal model configuration files"""
-    return Path(auxiliaryfunctions.get_deeplabcut_path()) / "modelzoo" / "model_configs"
+    return auxiliaryfunctions.get_deeplabcut_path() / "modelzoo" / "model_configs"
 
 
 def get_project_configs_folder_path() -> Path:
     """Returns: the folder containing the SuperAnimal project configuration files"""
-    return Path(auxiliaryfunctions.get_deeplabcut_path()) / "modelzoo" / "project_configs"
+    return auxiliaryfunctions.get_deeplabcut_path() / "modelzoo" / "project_configs"
 
 
 def get_snapshot_folder_path() -> Path:
     """Returns: the path to the folder containing the SuperAnimal model snapshots"""
-    return Path(auxiliaryfunctions.get_deeplabcut_path()) / "modelzoo" / "checkpoints"
+    return auxiliaryfunctions.get_deeplabcut_path() / "modelzoo" / "checkpoints"
 
 
 def get_super_animal_model_config_path(model_name: str) -> Path:
@@ -89,7 +89,7 @@ def get_super_animal_snapshot_path(
     return model_path
 
 
-@deprecated(replacement="PoseConfig.build_for_superanimal_inference", since="3.1")
+@deprecated(replacement="PoseConfig.build_for_superanimal_inference", since="3.0.1")
 def load_super_animal_config(
     super_animal: str,
     model_name: str,
@@ -119,7 +119,7 @@ def download_super_animal_snapshot(dataset: str, model_name: str) -> Path:
         The path to the downloaded snapshot.
 
     Raises:
-        RuntimeError if the model fails to download.
+        RuntimeError: If the model fails to download.
     """
     snapshot_dir = get_snapshot_folder_path()
     model_name = f"{dataset}_{model_name}"

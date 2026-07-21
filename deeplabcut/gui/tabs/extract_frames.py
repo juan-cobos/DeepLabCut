@@ -32,19 +32,14 @@ def select_cropping_area(config, videos=None):
     to draw a box and hit the button 'set cropping parameters' to store the cropping
     parameters for a video in the config.yaml file.
 
-    Parameters
-    ----------
-    config : string
-        Full path of the config.yaml file as a string.
+    Args:
+        config (string): Full path of the config.yaml file as a string.
+        videos (optional): List of videos whose cropping areas are to be defined. Note
+            that full paths are required. By default, all videos in the config are
+            successively loaded. Defaults to None.
 
-    videos : optional (default=None)
-        List of videos whose cropping areas are to be defined. Note that full paths are required.
-        By default, all videos in the config are successively loaded.
-
-    Returns
-    -------
-    cfg : dict
-        Updated project configuration
+    Returns:
+        dict: Updated project configuration.
     """
     from deeplabcut.gui.widgets import FrameCropper
     from deeplabcut.utils import auxiliaryfunctions
@@ -187,7 +182,7 @@ class ExtractFrames(DefaultTab):
         self.root.logger.info(f"Cropping set to '{cropping_option}'")
 
     def extract_frames(self):
-        config = self.root.config
+        config_path = self.root.config_path
         mode = self.extraction_method_widget.currentText()
         if mode == "manual":
             videos = list(self.video_selection_widget.files)
@@ -211,14 +206,14 @@ class ExtractFrames(DefaultTab):
 
         crop = False  # default value
         if self.frame_cropping_widget.currentText() == "GUI":
-            _ = select_cropping_area(config)
+            _ = select_cropping_area(config_path)
             crop = True
         elif self.frame_cropping_widget.currentText() == "read from config":
             crop = True
 
         func = partial(
             extract_frames,
-            config,
+            config_path,
             mode,
             algo,
             crop=crop,
@@ -231,6 +226,9 @@ class ExtractFrames(DefaultTab):
         )
 
         self.worker, self.thread = move_to_separate_thread(func, capture_outputs=True)
+        self._extract_error = False
+        self.worker.error.connect(self.root.show_task_error)
+        self.worker.error.connect(lambda _err: setattr(self, "_extract_error", True))
         self.worker.finished.connect(lambda: self.ok_button.setEnabled(True))
         self.worker.finished.connect(lambda: self.root._progress_bar.hide())
         self.thread.finished.connect(self._show_success_message)
@@ -239,6 +237,9 @@ class ExtractFrames(DefaultTab):
         self.root._progress_bar.show()
 
     def _show_success_message(self):
+        if getattr(self, "_extract_error", False):
+            return
+
         message = "Failed to create worker: it is None"
         root_message = "failed to extract frames: worker is None"
         if self.worker is not None:
@@ -282,11 +283,11 @@ class ExtractFrames(DefaultTab):
             the path to the video (or symlink) in the project's 'videos' folder
 
         Raises:
-            FileNotFoundError if there is no symlink or video in the 'videos' folder for
+            FileNotFoundError: If there is no symlink or video in the 'videos' folder for
                 the given video
         """
-        video_path = Path(video_path).resolve()
-        project_videos = (Path(self.root.config).parent / "videos").resolve()
+        video_path = Path(video_path).absolute()
+        project_videos = (Path(self.root.config_path).parent / "videos").absolute()
         if video_path.parent == project_videos:
             return video_path
 

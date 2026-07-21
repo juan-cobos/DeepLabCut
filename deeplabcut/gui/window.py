@@ -9,19 +9,21 @@
 # Licensed under GNU Lesser General Public License v3.0
 #
 import logging
-import os
 import sys
 import warnings
+from enum import Enum, auto
 from functools import cached_property
+from html import escape
 from importlib.resources import files
 from importlib.util import find_spec
 from pathlib import Path
 
 import qdarkstyle
 from napari_deeplabcut import __version__ as NAPARI_DLC_VERSION
+from pydantic import ValidationError
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QIcon, QPixmap
+from PySide6.QtGui import QAction, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QLabel,
@@ -34,11 +36,20 @@ from PySide6.QtWidgets import (
 
 import deeplabcut
 from deeplabcut import __version__ as DLC_VERSION
-from deeplabcut import auxiliaryfunctions, compat
+from deeplabcut import auxiliaryfunctions
+from deeplabcut.core.config import ProjectConfig
 from deeplabcut.core.debug import install_debug_recorder
 from deeplabcut.core.engine import Engine
-from deeplabcut.gui import BASE_DIR, components
+from deeplabcut.generate_training_dataset.metadata import get_shuffle_engine
+from deeplabcut.gui import components
+from deeplabcut.gui.config_file_monitor import ConfigFileMonitor
 from deeplabcut.gui.dialogs import create_generate_debug_log_action
+from deeplabcut.gui.dialogs.config_errors import (
+    CONFIG_LOAD_ERRORS,
+    ConfigErrorReport,
+    format_config_error,
+)
+from deeplabcut.gui.gui_assets import icon_from_resource, pixmap_from_resource
 from deeplabcut.gui.tabs import (
     AnalyzeVideos,
     CreateTrainingDataset,
@@ -56,14 +67,37 @@ from deeplabcut.gui.tabs import (
     UnsupervizedIdTracking,
     VideoEditor,
 )
-from deeplabcut.gui.utils import UpdateChecker, _build_update_commands
-from deeplabcut.gui.widgets import StreamReceiver, StreamWriter
+from deeplabcut.gui.utils import UpdateChecker, _build_update_commands, absolute_path
+from deeplabcut.gui.widgets import (
+    StreamReceiver,
+    StreamWriter,
+)
 
 warnings.filterwarnings(
     "ignore",
     message=r".*shibokensupport/signature/parser.py:269: RuntimeWarning: pyside_type_init:_resolve_value.*",
     category=RuntimeWarning,
 )
+
+WINDOW_RESIZE_FACTOR = 0.8
+DEFAULT_MINIMUM_WIDTH, DEFAULT_MINIMUM_HEIGHT = 800, 600
+
+
+def _is_pose_config_validation_error(error: ValidationError) -> bool:
+    """Return True if *error* was raised by a PoseConfig model."""
+    try:
+        from deeplabcut.pose_estimation_pytorch.config.pose import PoseConfig as _PoseConfig
+    except (ImportError, RuntimeError):
+        return False
+
+    return getattr(error, "model", None) is _PoseConfig
+
+
+class ConfigErrorAction(Enum):
+    """Recovery action selected after a configuration error."""
+
+    CANCEL = auto()
+    RETRY = auto()
 
 
 class MainWindow(QMainWindow):
@@ -85,13 +119,14 @@ class MainWindow(QMainWindow):
         self.logger = logging.getLogger("deeplabcut.gui")
         self.console_logger = logging.getLogger("deeplabcut.gui.console")
 
-        self.config = None
+        self._config_monitor = None
+        self.config_path: Path | None = None
         self.loaded = False
 
         self.shuffle_value = 1
         self.trainingset_index = 0
         self.videotype = "mp4"
-        self.files = set()
+        self.files: set[Path] = set()
 
         self._engine = Engine.PYTORCH
 
@@ -147,6 +182,12 @@ class MainWindow(QMainWindow):
         self._progress_bar.hide()
         self.status_bar.addPermanentWidget(self._progress_bar)
 
+        self._config_monitor = ConfigFileMonitor(
+            status_bar=self.status_bar,
+            on_reload=self.reload_project_config,
+            parent=self,
+        )
+
     def print_to_status_bar(self, text):
         self.status_bar.showMessage(text)
         self.status_bar.repaint()
@@ -183,12 +224,28 @@ class MainWindow(QMainWindow):
         self.recentfiles_menu.insertAction(before_action, action)
 
     @property
-    def cfg(self):
-        try:
-            cfg = auxiliaryfunctions.read_config(self.config)
-        except TypeError:
-            cfg = {}
-        return cfg
+    def config_path(self) -> Path | None:
+        return self._config_path
+
+    @config_path.setter
+    def config_path(self, value: Path | None) -> None:
+        self._config_path = value
+        self.invalidate_config_cache()
+        if self._config_monitor is not None:
+            self._config_monitor.set_path(str(value) if value is not None else None)
+
+    @property
+    def cfg(self) -> ProjectConfig | None:
+        """The loaded project configuration, read from disk and cached.
+
+        The cache is invalidated whenever ``config_path`` is assigned; retry
+        loops reset it explicitly to force a fresh read from disk.
+        """
+        if self.config_path is None:
+            return None
+        if self._cfg is None:
+            self._cfg = auxiliaryfunctions.read_config(self.config_path)
+        return self._cfg
 
     @property
     def engine(self) -> Engine:
@@ -217,9 +274,8 @@ class MainWindow(QMainWindow):
 
                 msg.setWindowTitle("Info")
                 msg.setMinimumWidth(900)
-                logo_dir = os.path.dirname(os.path.realpath("logo.png")) + os.path.sep
-                logo = logo_dir + "/assets/logo.png"
-                msg.setWindowIcon(QIcon(logo))
+                icon = icon_from_resource("logo.png")
+                msg.setWindowIcon(icon)
                 msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
                 msg.exec_()
 
@@ -227,70 +283,90 @@ class MainWindow(QMainWindow):
         self.engine_change.emit(e)
 
     @property
-    def project_folder(self) -> str:
-        return self.cfg.get("project_path", os.path.expanduser("~/Desktop"))
+    def project_folder(self) -> Path:
+        cfg = self.cfg
+        if cfg is None:
+            return Path("~/Desktop").expanduser().absolute()
+        return cfg.project_path
 
     @property
     def is_multianimal(self) -> bool:
-        return bool(self.cfg.get("multianimalproject"))
+        cfg = self.cfg
+        return cfg is not None and cfg.multianimalproject
 
     @property
     def all_bodyparts(self) -> list:
-        if self.is_multianimal:
-            return self.cfg.get("multianimalbodyparts")
-        else:
-            return self.cfg["bodyparts"]
+        cfg = self.cfg
+        if cfg is None:
+            return []
+        if cfg.multianimalproject:
+            return cfg.multianimalbodyparts
+        return cfg.bodyparts
 
     @property
     def all_individuals(self) -> list:
-        if self.is_multianimal:
-            return self.cfg.get("individuals")
-        else:
-            return [""]
+        cfg = self.cfg
+        if cfg is not None and cfg.multianimalproject:
+            return cfg.individuals
+        return [""]
 
     @property
-    def pose_cfg_path(self) -> str:
+    def _selected_model_train_folder(self) -> tuple[Path, Engine]:
+        """Resolve model paths from the validated project-config snapshot."""
+        cfg = self.cfg
+        if cfg is None:
+            raise RuntimeError("No project configuration is loaded.")
+
+        shuffle = int(self.shuffle_value)
+        trainingset_index = int(self.trainingset_index)
+        engine = get_shuffle_engine(
+            cfg,
+            trainingsetindex=trainingset_index,
+            shuffle=shuffle,
+        )
+        model_folder = auxiliaryfunctions.get_model_folder(
+            cfg.TrainingFraction[trainingset_index],
+            shuffle,
+            cfg,
+            engine=engine,
+        )
+        return Path(cfg.project_path) / model_folder / "train", engine
+
+    @property
+    def pose_cfg_path(self) -> Path:
         try:
-            return str(
-                compat.return_train_network_path(
-                    self.config,
-                    shuffle=int(self.shuffle_value),
-                    trainingsetindex=int(self.trainingset_index),
-                    modelprefix="",
-                )[0]
-            )
+            train_folder, engine = self._selected_model_train_folder
+            filename = "pytorch_config.yaml" if engine == Engine.PYTORCH else "pose_cfg.yaml"
+            return train_folder / filename
         except FileNotFoundError:
-            return str(Path(deeplabcut.__file__).parent / "pose_cfg.yaml")
+            return (Path(deeplabcut.__file__).parent / "pose_cfg.yaml").absolute()
 
     @property
-    def models_folder(self) -> str:
+    def models_folder(self) -> Path:
         try:
-            return str(
-                compat.return_train_network_path(
-                    self.config,
-                    shuffle=int(self.shuffle_value),
-                    trainingsetindex=int(self.trainingset_index),
-                    modelprefix="",
-                )[2]
-            )
+            train_folder, _ = self._selected_model_train_folder
+            return train_folder
         except FileNotFoundError:
-            return self.project_folder()
+            return self.project_folder
 
     @property
-    def inference_cfg_path(self) -> str:
-        return os.path.join(
-            self.cfg["project_path"],
-            auxiliaryfunctions.get_model_folder(
-                self.cfg["TrainingFraction"][int(self.trainingset_index)],
+    def inference_cfg_path(self) -> Path:
+        cfg = self.cfg
+        if cfg is None:
+            raise RuntimeError("No project configuration is loaded.")
+        return (
+            cfg.project_path
+            / auxiliaryfunctions.get_model_folder(
+                cfg.TrainingFraction[int(self.trainingset_index)],
                 int(self.shuffle_value),
-                self.cfg,
-            ),
-            "test",
-            "inference_cfg.yaml",
+                cfg,
+            )
+            / "test"
+            / "inference_cfg.yaml"
         )
 
     def update_cfg(self, text):
-        self.root.config = text
+        self.config_path = Path(text).absolute() if text else None
         self.unsupervised_id_tracking.setEnabled(self.is_transreid_available())
 
     def update_shuffle(self, value):
@@ -306,7 +382,7 @@ class MainWindow(QMainWindow):
     def video_type(self, ext):
         self.videotype = ext
         self.video_type_.emit(ext)
-        self.logger.info(f"Video type set to {self.video_type}")
+        self.logger.debug(f"Video type set to {self.video_type}")
 
     @property
     def video_files(self):
@@ -586,7 +662,7 @@ class MainWindow(QMainWindow):
         Add new video files to the existing set of files. This method ensures no duplicates are added.
         Emits a signal to notify about the updated set of files.
         """
-        new_video_files = set(new_video_files)
+        new_video_files = {Path(video).absolute() for video in new_video_files}
         self.files.update(new_video_files)  # Add new items to the existing set
         self.video_files_.emit(self.files)  # Emit the updated set of files
         self.logger.info(f"Videos added to analyze:\n{new_video_files}\nCurrent video files:\n{self.files}")
@@ -597,11 +673,9 @@ class MainWindow(QMainWindow):
         """
         self.files.clear()  # Reset the set to be empty
         self.video_files_.emit(self.files)  # Emit the empty set
-        self.logger.info("All video files have been cleared.")
+        self.logger.debug("All video files have been cleared.")
 
     def window_set(self):
-        WINDOW_RESIZE_FACTOR = 0.8
-        DEFAULT_MINIMUM_WIDTH, DEFAULT_MINIMUM_HEIGHT = 800, 600
 
         self.setWindowTitle("DeepLabCut")
 
@@ -609,8 +683,7 @@ class MainWindow(QMainWindow):
         palette.setColor(QtGui.QPalette.Window, QtGui.QColor("#ffffff"))
         self.setPalette(palette)
 
-        icon = os.path.join(BASE_DIR, "assets", "logo.png")
-        self.setWindowIcon(QIcon(icon))
+        self.setWindowIcon(icon_from_resource("logo.png"))
 
         # Set default window size and allow resizing
         self.resize(
@@ -618,7 +691,7 @@ class MainWindow(QMainWindow):
             int(self.screen_height * WINDOW_RESIZE_FACTOR),
         )
         self.setMinimumSize(DEFAULT_MINIMUM_WIDTH, DEFAULT_MINIMUM_HEIGHT)
-        self.setMaximumSize(self.screen_width, self.screen_height)
+        # self.setMaximumSize(self.screen_width, self.screen_height) # prevents proper Maximize
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
         self.setWindowFlag(Qt.WindowCloseButtonHint, True)
@@ -643,8 +716,7 @@ class MainWindow(QMainWindow):
         image_widget = QtWidgets.QLabel(self)
         image_widget.setAlignment(Qt.AlignCenter)
         image_widget.setContentsMargins(0, 0, 0, 0)
-        logo = os.path.join(BASE_DIR, "assets", "logo_transparent.png")
-        pixmap = QtGui.QPixmap(logo)
+        pixmap = pixmap_from_resource("logo_transparent.png")
         image_widget.setPixmap(pixmap.scaledToHeight(400, QtCore.Qt.SmoothTransformation))
         self.layout.addWidget(image_widget)
         description = (
@@ -693,14 +765,14 @@ class MainWindow(QMainWindow):
         self.name_default = ""
         self.proj_default = ""
         self.exp_default = ""
-        self.loc_default = str(Path.home())
+        self.loc_default = Path.home()
 
     def create_actions(self, names):
         # Creating action using the first constructor
         self.newAction = QAction(self)
         self.newAction.setText("&New Project...")
 
-        self.newAction.setIcon(QIcon(os.path.join(BASE_DIR, "assets", "icons", names[0])))
+        self.newAction.setIcon(icon_from_resource("icons", names[0]))
         self.newAction.setShortcut("Ctrl+N")
         self.newAction.setStatusTip("Create a new project...")
 
@@ -708,7 +780,7 @@ class MainWindow(QMainWindow):
 
         # Creating actions using the second constructor
         self.openAction = QAction("&Open...", self)
-        self.openAction.setIcon(QIcon(os.path.join(BASE_DIR, "assets", "icons", names[1])))
+        self.openAction.setIcon(icon_from_resource("icons", names[1]))
         self.openAction.setShortcut("Ctrl+O")
         self.openAction.setStatusTip("Open a project...")
         self.openAction.triggered.connect(self._open_project)
@@ -722,7 +794,7 @@ class MainWindow(QMainWindow):
         self.darkmodeAction.triggered.connect(self.darkmode)
 
         self.helpAction = QAction("&Help", self)
-        self.helpAction.setIcon(QIcon(os.path.join(BASE_DIR, "assets", "icons", names[2])))
+        self.helpAction.setIcon(icon_from_resource("icons", names[2]))
         self.helpAction.setStatusTip("Ask for help...")
         self.helpAction.triggered.connect(self._ask_for_help)
 
@@ -752,7 +824,8 @@ class MainWindow(QMainWindow):
         self.file_menu.addAction(self.openAction)
 
         self.recentfiles_menu = self.file_menu.addMenu("Open Recent")
-        self.recentfiles_menu.triggered.connect(lambda a: self._update_project_state(a.text(), True))
+        # self.recentfiles_menu.triggered.connect(lambda a: self._update_project_state(a.text(), True))
+        self.recentfiles_menu.triggered.connect(self._open_recent_project)
         self.file_menu.addAction(self.saveAction)
         self.file_menu.addAction(self.exitAction)
 
@@ -828,12 +901,40 @@ class MainWindow(QMainWindow):
         self.toolbar.removeAction(self.openAction)
         self.toolbar.removeAction(self.helpAction)
 
-    def _update_project_state(self, config, loaded):
-        self.config = config
-        self.loaded = loaded
-        if loaded:
-            self.add_recent_filename(self.config)
-            self.add_tabs()
+    def _update_project_state(
+        self,
+        config: str | Path,
+        loaded: bool,
+    ) -> bool:
+        """Select a project and build its UI from the current config."""
+        self.config_path = absolute_path(config)
+        self.loaded = False
+
+        if not loaded:
+            return True
+
+        # Do not keep an old project's controls active while self.config_path
+        # points to a newly selected project.
+        self._generate_welcome_page()
+
+        if not self._build_project_ui_from_current_config():
+            return False
+
+        self.loaded = True
+        self._config_monitor.mark_current()
+        self.add_recent_filename(str(self.config_path))
+        return True
+
+    def reload_project_config(self) -> bool:
+        """Reload the active project configuration and rebuild its UI."""
+        if self.config_path is None:
+            return False
+        return self._update_project_state(self.config_path, loaded=True)
+
+    def invalidate_config_cache(self) -> None:
+        """Drop the cached project configuration so the next ``self.cfg``
+        access performs a fresh read-and-validate from disk."""
+        self._cfg = None
 
     def _ask_for_help(self):
         dlg = QMessageBox(self)
@@ -855,16 +956,237 @@ class MainWindow(QMainWindow):
         dlg = ProjectCreator(self)
         dlg.show()
 
-    def _open_project(self):
+    def _open_config_with_system_application(
+        self,
+        config_path: str | Path | None = None,
+    ) -> bool:
+        """Open a config (default: the project config) with the OS default app."""
+        path = Path(config_path) if config_path is not None else self.config_path
+        if path is None:
+            return False
+
+        if not path.is_file():
+            QMessageBox.warning(
+                self,
+                "Configuration not found",
+                (f"The project configuration no longer exists:\n\n{path}"),
+            )
+            return False
+
+        config_url = QtCore.QUrl.fromLocalFile(str(path))
+        opened = QDesktopServices.openUrl(config_url)
+
+        if not opened:
+            self.logger.warning(
+                "The operating system could not open configuration %s",
+                path,
+            )
+
+        return opened
+
+    def _show_config_error(
+        self,
+        report: ConfigErrorReport,
+    ) -> ConfigErrorAction:
+        """Show a configuration error and offer external editing and reload."""
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Critical)
+        message.setWindowTitle(report.title)
+        message.setText(report.summary)
+        message.setInformativeText(report.details)
+        message.setDetailedText(report.technical_details)
+
+        open_button = message.addButton(
+            "Open configuration",
+            QMessageBox.ActionRole,
+        )
+        reload_button = message.addButton(
+            "Reload",
+            QMessageBox.AcceptRole,
+        )
+        cancel_button = message.addButton(
+            QMessageBox.Cancel,
+        )
+
+        message.setDefaultButton(reload_button)
+
+        while True:
+            message.exec()
+            clicked_button = message.clickedButton()
+
+            # close -> cancel
+            if clicked_button is None:
+                return ConfigErrorAction.CANCEL
+
+            if clicked_button is reload_button:
+                return ConfigErrorAction.RETRY
+
+            if clicked_button is cancel_button:
+                return ConfigErrorAction.CANCEL
+
+            if clicked_button is open_button:
+                if self._open_config_with_system_application():
+                    message.setTextFormat(Qt.RichText)
+                    message.setInformativeText(
+                        f"{escape(report.details).replace(chr(10), '<br>')}<br><br>"
+                        "<b>The configuration was opened in your default application. "
+                        "Save your changes, then click Reload.</b>"
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Could not open configuration",
+                        (
+                            "DeepLabCut could not open the configuration "
+                            "with a system application.\n\n"
+                            f"Open it manually:\n{self.config_path}"
+                        ),
+                    )
+
+    def show_task_error(
+        self,
+        error: Exception,
+        config_path: str | Path | None = None,
+    ) -> None:
+        """Show an error raised by a GUI-launched task (e.g. training, analysis).
+
+        Unlike the project-config recovery loop, this only reports the failure;
+        the user fixes the file and re-runs the action.
+        """
+        if config_path is None:
+            if isinstance(error, ValidationError) and _is_pose_config_validation_error(error):
+                config_path = self.pose_cfg_path
+            else:
+                config_path = self.config_path
+
+        self.logger.error("Task failed: %s", error, exc_info=error)
+
+        if isinstance(error, ValidationError):
+            report = format_config_error(config_path or "<unknown>", error)
+        else:
+            report = ConfigErrorReport(
+                title="Task failed",
+                summary="DeepLabCut could not complete the task.",
+                details=str(error),
+                technical_details=repr(error),
+            )
+
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Critical)
+        message.setWindowTitle(report.title)
+        message.setText(report.summary)
+        message.setInformativeText(report.details)
+        message.setDetailedText(report.technical_details)
+
+        open_button = None
+        if config_path is not None and isinstance(error, ValidationError):
+            open_button = message.addButton(
+                "Open configuration",
+                QMessageBox.ActionRole,
+            )
+        message.addButton(QMessageBox.Close)
+
+        message.exec()
+
+        if open_button is not None and message.clickedButton() is open_button:
+            self._open_config_with_system_application(config_path)
+
+    def _handle_config_error(self, error: Exception) -> ConfigErrorAction:
+        """Log and present a recoverable project configuration error."""
+        if isinstance(error, ValidationError):
+            self.logger.warning(
+                "Invalid project configuration %s (%d validation error%s)",
+                self.config_path,
+                error.error_count(),
+                "" if error.error_count() == 1 else "s",
+            )
+        else:
+            self.logger.warning(
+                "Could not read project configuration %s: %s",
+                self.config_path,
+                error,
+            )
+
+        self.logger.debug(
+            "Project configuration error details",
+            exc_info=(
+                type(error),
+                error,
+                error.__traceback__,
+            ),
+        )
+
+        report = format_config_error(
+            self.config_path,
+            error,
+        )
+        return self._show_config_error(report)
+
+    def _build_project_ui_from_current_config(self) -> bool:
+        """Build project tabs using the current config file on disk.
+
+        Every attempt starts by invalidating the cached configuration, so
+        each retry performs a fresh read and validation from disk.
+        """
+        if self.config_path is None:
+            return False
+
+        while True:
+            self._discard_partial_project_tabs()
+            self.invalidate_config_cache()
+
+            try:
+                # Read and validate; tabs reuse the cached snapshot via self.cfg.
+                self._read_current_config_for_ui()
+                self.add_tabs()
+                return True
+
+            except CONFIG_LOAD_ERRORS as error:
+                self._discard_partial_project_tabs()
+                self._generate_welcome_page()
+                action = self._handle_config_error(error)
+
+            except Exception:
+                self._discard_partial_project_tabs()
+                self._generate_welcome_page()
+                raise
+
+            if action is ConfigErrorAction.RETRY:
+                # Loop back and perform a fresh read from disk.
+                continue
+
+            return False
+
+    def _open_project(self) -> None:
         open_project = OpenProject(self)
         open_project.load_config()
-        if not open_project.config:
+        if not open_project.config_path:
             return
 
-        open_project.loaded = True
         self._update_project_state(
-            open_project.config,
-            open_project.loaded,
+            open_project.config_path,
+            loaded=True,
+        )
+
+    def _open_recent_project(
+        self,
+        action: QAction,
+    ) -> None:
+        """Open a recent project through the normal validation boundary."""
+        config_path = absolute_path(action.text())
+
+        if not config_path.is_file():
+            QMessageBox.warning(
+                self,
+                "Project not found",
+                (f"The project configuration no longer exists:\n\n{config_path}"),
+            )
+            self.recentfiles_menu.removeAction(action)
+            return
+
+        self._update_project_state(
+            config_path,
+            loaded=True,
         )
 
     def _goto_superanimal(self):
@@ -874,10 +1196,42 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(self.modelzoo, "Model Zoo")
         self.setCentralWidget(self.tab_widget)
 
-    def load_config(self, config):
-        self.config = config
-        self.config_loaded.emit()
-        print(f'Project "{self.cfg["Task"]}" successfully loaded.')
+    def _read_current_config_for_ui(self) -> ProjectConfig:
+        """Read the current config from disk for a UI-building attempt."""
+        cfg = self.cfg
+        if cfg is None:
+            raise FileNotFoundError("No project configuration is selected.")
+        return cfg
+
+    def load_config(
+        self,
+        config: str | Path,
+    ) -> bool:
+        """Reload a config from disk and notify config-dependent widgets."""
+        self.config_path = absolute_path(config)
+
+        while True:
+            self.invalidate_config_cache()
+
+            try:
+                cfg = self._read_current_config_for_ui()
+            except CONFIG_LOAD_ERRORS as error:
+                action = self._handle_config_error(error)
+
+                if action is ConfigErrorAction.RETRY:
+                    continue
+
+                return False
+
+            self.config_loaded.emit()
+
+            task = cfg.Task or self.config_path.parent.name
+            self.logger.info(
+                'Project "%s" successfully loaded.',
+                task,
+            )
+            self._config_monitor.mark_current()
+            return True
 
     def darkmode(self):
         dark_stylesheet = qdarkstyle.load_stylesheet_pyside2()
@@ -900,6 +1254,27 @@ class MainWindow(QMainWindow):
         self.create_actions(names)
         self.create_toolbar()
         self.update_menu_bar()
+
+    def _discard_partial_project_tabs(self) -> None:
+        """Dispose of tabs created during a failed UI-building attempt."""
+        tab_widget = getattr(self, "tab_widget", None)
+
+        if tab_widget is None:
+            return
+
+        try:
+            if self.centralWidget() is tab_widget:
+                self.takeCentralWidget()
+        except RuntimeError:
+            # The Qt object may already have been scheduled for deletion.
+            pass
+
+        try:
+            tab_widget.deleteLater()
+        except RuntimeError:
+            pass
+
+        self.tab_widget = None
 
     def add_tabs(self):
         self.tab_widget = QtWidgets.QTabWidget()
@@ -984,7 +1359,7 @@ class MainWindow(QMainWindow):
                 pass
 
         _attempt_attribute_update("shuffle", self.shuffle_value)
-        _attempt_attribute_update("cfg_line", self.config)
+        _attempt_attribute_update("cfg_line", str(self.config_path) if self.config_path else "")
 
     def is_transreid_available(self):
         if not self.is_multianimal:

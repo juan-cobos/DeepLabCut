@@ -13,7 +13,7 @@ from functools import partial
 from pathlib import Path
 
 from PySide6 import QtWidgets
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 import deeplabcut
 from deeplabcut.core.config import ProjectConfig
@@ -33,7 +33,7 @@ from deeplabcut.gui.widgets import ConfigEditor
 
 @dataclass(frozen=True)
 class AnalyzeVideosOptions:
-    config: str
+    config_path: str | Path
     shuffle: int
     save_as_csv: bool
     filter_data: bool
@@ -53,6 +53,11 @@ class AnalyzeVideosOptions:
 class AnalyzeVideos(DefaultTab):
     def __init__(self, root, parent, h1_description):
         super().__init__(root, parent, h1_description)
+
+        self._reload_timer = QTimer(self)
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.setInterval(0)
+        self._reload_timer.timeout.connect(self.root.reload_project_config)
 
         self._set_page()
 
@@ -263,13 +268,15 @@ class AnalyzeVideos(DefaultTab):
             self.root.logger.info("Plot trajectories DISABLED.")
 
     def edit_config_file(self):
-        if not self.root.config:
+        if not self.root.config_path:
             return
-        editor = ConfigEditor(self.root.config)
+        config = self.root.config_path
+        editor = ConfigEditor(config, parent=self.root)
+        editor.accepted.connect(self._reload_timer.start)
         editor.show()
 
     def _collect_options(self) -> AnalyzeVideosOptions:
-        config = self.root.config
+        config_path = self.root.config_path
         shuffle = self.root.shuffle_value
         save_as_csv = self.save_as_csv.isChecked()
         filter_data = self.filter_predictions.isChecked()
@@ -305,7 +312,7 @@ class AnalyzeVideos(DefaultTab):
             dynamic_cropping_params = (True, 0.5, 10)
 
         return AnalyzeVideosOptions(
-            config=config,
+            config_path=config_path,
             shuffle=shuffle,
             save_as_csv=save_as_csv,
             filter_data=filter_data,
@@ -331,26 +338,26 @@ class AnalyzeVideos(DefaultTab):
         batches = [(suffix, videos) for suffix, videos in sorted(groups.items()) if suffix]
         return batches
 
-    def _get_unique_video_parent_folders(self, batches: list[tuple[str, list[str]]]) -> list[str]:
+    def _get_unique_video_parent_folders(self, batches: list[tuple[str, list[Path]]]) -> list[Path]:
         folders = []
         seen = set()
 
         for _, videos in batches:
             for video in videos:
-                parent = str(Path(video).parent.resolve())
+                parent = video.parent.absolute()
                 if parent not in seen:
                     seen.add(parent)
                     folders.append(parent)
 
         return folders
 
-    def _run_pipeline(self, options: AnalyzeVideosOptions, batches: list[tuple[str, list[str]]]):
+    def _run_pipeline(self, options: AnalyzeVideosOptions, batches: list[tuple[str, list[Path]]]):
         for videotype, videos in batches:
             try:
                 self.root.logger.info(f"Analyzing {len(videos)} video(s) with extension {videotype}")
 
                 deeplabcut.analyze_videos(
-                    options.config,
+                    options.config_path,
                     videos=videos,
                     video_extensions=videotype,
                     shuffle=options.shuffle,
@@ -381,7 +388,7 @@ class AnalyzeVideos(DefaultTab):
     ):
         if options.create_video_all_detections:
             deeplabcut.create_video_with_all_detections(
-                options.config,
+                options.config_path,
                 videos=videos,
                 video_extensions=videotype,
                 shuffle=options.shuffle,
@@ -389,7 +396,7 @@ class AnalyzeVideos(DefaultTab):
 
         if options.filter_data:
             deeplabcut.filterpredictions(
-                options.config,
+                options.config_path,
                 video=videos,
                 video_extensions=videotype,
                 shuffle=options.shuffle,
@@ -401,7 +408,7 @@ class AnalyzeVideos(DefaultTab):
 
         if options.plot_trajectories:
             deeplabcut.plot_trajectories(
-                options.config,
+                options.config_path,
                 videos=videos,
                 displayedbodyparts=options.displayed_bodyparts,
                 video_extensions=videotype,
@@ -411,7 +418,7 @@ class AnalyzeVideos(DefaultTab):
                 track_method=options.track_method,
             )
 
-    def _convert_outputs_to_csv_once_per_folder(self, batches: list[tuple[str, list[str]]]):
+    def _convert_outputs_to_csv_once_per_folder(self, batches: list[tuple[str, list[Path]]]):
         folders = self._get_unique_video_parent_folders(batches)
 
         for folder in folders:
@@ -432,16 +439,16 @@ class AnalyzeVideos(DefaultTab):
         # Keep config in sync with GUI choice before launching worker
         if self.root.is_multianimal and options.track_method is not None:
             # NOTE @deruyter92 2026-06-23: Most of GUI is not migrated to typed configs yet, so we normalize here.
-            cfg = ProjectConfig.from_any(self.root.config, repair_path=True)
-            cfg_path = self.root.config if isinstance(self.root.config, (str, Path)) else cfg.config_yaml_path
+            cfg = ProjectConfig.from_any(self.root.config_path, repair_path=True)
 
             # Update track method and write to disk
             cfg.default_track_method = options.track_method
-            cfg.to_yaml(cfg_path, overwrite=True, log_changes=True, mark_clean=True)
+            cfg.to_yaml(self.root.config_path, overwrite=True, log_changes=True, mark_clean=True)
 
         func = partial(self._run_pipeline, options, batches)
 
         self.worker, self.thread = move_to_separate_thread(func)
+        self.worker.error.connect(self.root.show_task_error)
         self.worker.finished.connect(lambda: self.analyze_videos_btn.setEnabled(True))
         self.worker.finished.connect(lambda: self.root._progress_bar.hide())
         self.thread.start()
