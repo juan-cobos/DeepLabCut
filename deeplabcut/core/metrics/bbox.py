@@ -136,31 +136,20 @@ def _get_metric(
     area_rng: str = "all",
     max_dets: int = 100,
 ) -> tuple[str, float]:
-    metric_name = "mAR" if recall else "mAP"
+    params = coco_eval.params
     if iou_threshold is not None:
         thresh = f"{int(100 * iou_threshold)}"
+        iou_index = np.where(iou_threshold == params.iouThrs)[0]
     else:
-        low, high = coco_eval.params.iouThrs[0], coco_eval.params.iouThrs[-1]
+        low, high = params.iouThrs[0], params.iouThrs[-1]
         thresh = f"{int(100 * low)}:{int(100 * high)}"
+        iou_index = slice(None)
 
-    aind = [i for i, aRng in enumerate(coco_eval.params.areaRngLbl) if aRng == area_rng]
-    mind = [i for i, mDet in enumerate(coco_eval.params.maxDets) if mDet == max_dets]
-    if recall:
-        s = coco_eval.eval["recall"]
-        if iou_threshold is not None:
-            t = np.where(iou_threshold == coco_eval.params.iouThrs)[0]
-            s = s[t]
-        s = s[:, :, aind, mind]
-    else:
-        s = coco_eval.eval["precision"]
-        if iou_threshold is not None:
-            t = np.where(iou_threshold == coco_eval.params.iouThrs)[0]
-            s = s[t]
-        s = s[:, :, :, aind, mind]
-
-    if len(s[s > -1]) == 0:
-        mean_s = -1
-    else:
-        mean_s = 100 * np.mean(s[s > -1]).item()
-
-    return f"{metric_name}@{thresh}", mean_s
+    area_index = [i for i, lbl in enumerate(params.areaRngLbl) if lbl == area_rng]
+    dets_index = [i for i, dets in enumerate(params.maxDets) if dets == max_dets]
+    metric_name = "mAR" if recall else "mAP"
+    scores = coco_eval.eval["recall" if recall else "precision"]
+    scores = scores[iou_index][..., area_index, dets_index]
+    scores = scores[scores > -1]
+    mean_score = 100 * np.mean(scores).item() if scores.size > 0 else -1
+    return f"{metric_name}@{thresh}", mean_score
