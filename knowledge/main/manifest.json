@@ -3,9 +3,9 @@
   "api_version_label": "main",
   "api_aliases": [],
   "api": {
-    "package_version": "3.0.2",
-    "revision": "4dcb9a7d5a701427ef78ecc8103d38eeef70601a",
-    "generated_at": "2026-09-18T07:36:59+00:00"
+    "package_version": "3.0.3",
+    "revision": "66936716fef676fbc93fc75f801932819d675926",
+    "generated_at": "2026-11-24T08:45:18+00:00"
   },
   "docs": {
     "package_version": "3.0.2",
